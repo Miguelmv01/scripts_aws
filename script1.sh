@@ -1,5 +1,5 @@
 #Creo la VPC y devuelvo su ID 
-VPC_ID=$(aws ec2 create-vpc --cidr-block 192.168.1.0/24 \
+VPC_ID=$(aws ec2 create-vpc --cidr-block 192.168.0.0/24 \
     --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=VPCMiguel}]' \
     --query Vpc.VpcId --output text)
 
@@ -14,7 +14,7 @@ aws ec2 modify-vpc-attribute \
 #Creamos la subred para la VPC 
 SUB_ID=$(aws ec2 create-subnet \
     --vpc-id $VPC_ID \
-    --cidr-block 192.168.1.0/28 \
+    --cidr-block 192.168.0.0/28 \
     --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=mi-subred1-miguel}]' \
     --query Subnet.SubnetId --output text)
 
