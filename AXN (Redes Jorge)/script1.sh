@@ -50,6 +50,7 @@ EC2_ID=$(aws ec2 run-instances \
     --instance-type t3.micro \
     --key-name vockey \
     --subnet-id $SUB_ID \
+    --security-group-ids $SG_ID \
     --associate-public-ip-address \
     --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=miec2}]' \
     --query Instances.InstancetId --output text)
