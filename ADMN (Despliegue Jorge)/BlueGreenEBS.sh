@@ -1,114 +1,87 @@
 #!/bin/bash
 
-# Configuración Global
-REGION="us-east-1"
-# Usamos Amazon Linux 2. Si falla, prueba con Amazon Linux 2023: ami-0230bd60aa48260c6
-AMI_ID="ami-0c614dee691cbbf37" 
+# --- CONFIGURACIÓN ---
+APP_NAME="BlueGreenApp"
+BUCKET_NAME="eb-bluegreen-test-$(date +%s)"
+REGION="us-east-1" 
+PLATFORM="64bit Amazon Linux 2023 v4.7.8 running PHP 8.2"
 
-echo "--- INICIANDO DESPLIEGUE (CORREGIDO) EN: $REGION ---"
+# CONFIGURACIÓN DE LABORATORIO (AÑADIDO)
+INSTANCE_PROFILE="LabInstanceProfile"
+KEY_PAIR="vockey"
 
-# 1. OBTENER VPC Y SUBNET
-VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --region $REGION --query "Vpcs[0].VpcId" --output text)
-SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" --region $REGION --query "Subnets[0].SubnetId" --output text)
+# Nombres de los entornos
+ENV_BLUE="bluegreen2"
+ENV_GREEN="bluegreen2-green"
 
-echo "VPC: $VPC_ID | Subnet: $SUBNET_ID"
+# --- 1. PREPARACIÓN DE ARCHIVOS ---
+echo "--- 1. Generando versiones HTML y ZIP ---"
 
-# 2. SEGURIDAD (Security Group) - CORRECCIÓN AQUÍ
-echo "--- Creando/Buscando Security Group ---"
+# Versión 1.0.0 (AZUL)
+echo '<html><body style="background-color:blue; color:white; display:flex; justify-content:center; align-items:center; height:100vh; font-family:sans-serif;"><h1>Hola Mundo (versión 1.0.0 - Azul)</h1></body></html>' > index.html
+zip v1.zip index.html
 
-# Intentamos crear y filtramos SOLO el GroupId
-SG_ID=$(aws ec2 create-security-group \
-    --group-name SG-Lab-ELB-Fixed \
-    --description "SG Lab ELB Fixed" \
-    --vpc-id $VPC_ID \
+# Versión 1.0.1 (VERDE)
+echo '<html><body style="background-color:green; color:white; display:flex; justify-content:center; align-items:center; height:100vh; font-family:sans-serif;"><h1>Hola Mundo (versión 1.0.1 - Verde)</h1></body></html>' > index.html
+zip v2.zip index.html
+
+rm index.html
+
+# --- 2. S3 ---
+echo "--- 2. Subiendo a S3 ---"
+aws s3 mb s3://$BUCKET_NAME --region $REGION
+aws s3 cp v1.zip s3://$BUCKET_NAME/v1.zip
+aws s3 cp v2.zip s3://$BUCKET_NAME/v2.zip
+
+# --- 3. APLICACIÓN ---
+echo "--- 3. Creando App y Versiones ---"
+aws elasticbeanstalk create-application --application-name $APP_NAME --region $REGION
+
+aws elasticbeanstalk create-application-version \
+    --application-name $APP_NAME --version-label "v1.0.0" \
+    --source-bundle S3Bucket=$BUCKET_NAME,S3Key=v1.zip --region $REGION
+
+aws elasticbeanstalk create-application-version \
+    --application-name $APP_NAME --version-label "v1.0.1" \
+    --source-bundle S3Bucket=$BUCKET_NAME,S3Key=v2.zip --region $REGION
+
+# --- 4. ENTORNO AZUL (CON ROL Y KEY) ---
+echo "--- 4. Lanzando Entorno AZUL (v1.0.0) con LabInstanceProfile... ---"
+
+aws elasticbeanstalk create-environment \
+    --application-name $APP_NAME \
+    --environment-name $ENV_BLUE \
+    --solution-stack-name "$PLATFORM" \
+    --version-label "v1.0.0" \
     --region $REGION \
-    --query 'GroupId' \
-    --output text 2>/dev/null)
+    --option-settings Namespace=aws:autoscaling:launchconfiguration,OptionName=IamInstanceProfile,Value=$INSTANCE_PROFILE \
+                      Namespace=aws:autoscaling:launchconfiguration,OptionName=EC2KeyName,Value=$KEY_PAIR
 
-# Si falla (porque ya existe), lo buscamos
-if [ -z "$SG_ID" ] || [ "$SG_ID" == "None" ]; then
-    echo "El grupo ya existía, recuperando ID..."
-    SG_ID=$(aws ec2 describe-security-groups \
-        --filters "Name=group-name,Values=SG-Lab-ELB-Fixed" \
-        --region $REGION \
-        --query "SecurityGroups[0].GroupId" \
-        --output text)
-else
-    echo "Grupo creado. Añadiendo regla HTTP..."
-    aws ec2 authorize-security-group-ingress --group-id $SG_ID --protocol tcp --port 80 --cidr 0.0.0.0/0 --region $REGION
-fi
+echo "Esperando a que AZUL esté listo..."
+aws elasticbeanstalk wait environment-exists --environment-names $ENV_BLUE --region $REGION
 
-# Limpiamos cualquier espacio en blanco que pueda haber quedado
-SG_ID=$(echo $SG_ID | xargs)
-echo "USANDO SECURITY GROUP ID: '$SG_ID'"
+# --- 5. ENTORNO VERDE (CON ROL Y KEY) ---
+echo "--- 5. Lanzando Entorno VERDE (v1.0.1) con LabInstanceProfile... ---"
 
-# 3. LANZAR INSTANCIA 1: BLUE
-echo "--- Lanzando bluecli ---"
-INSTANCE_BLUE=$(aws ec2 run-instances \
-    --image-id $AMI_ID \
-    --count 1 \
-    --instance-type t2.micro \
-    --security-group-ids "$SG_ID" \
-    --subnet-id "$SUBNET_ID" \
+aws elasticbeanstalk create-environment \
+    --application-name $APP_NAME \
+    --environment-name $ENV_GREEN \
+    --solution-stack-name "$PLATFORM" \
+    --version-label "v1.0.1" \
     --region $REGION \
-    --user-data '#!/bin/bash
-                 yum update -y
-                 yum install -y httpd
-                 systemctl start httpd
-                 systemctl enable httpd
-                 echo "<html><body style=\"background-color:blue; color:white; text-align:center; margin-top:50px;\"><h1>APP V1: BLUE</h1><p>Instancia: bluecli</p></body></html>" > /var/www/html/index.html' \
-    --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=bluecli}]' \
-    --query 'Instances[0].InstanceId' \
-    --output text)
+    --option-settings Namespace=aws:autoscaling:launchconfiguration,OptionName=IamInstanceProfile,Value=$INSTANCE_PROFILE \
+                      Namespace=aws:autoscaling:launchconfiguration,OptionName=EC2KeyName,Value=$KEY_PAIR
 
-# 4. LANZAR INSTANCIA 2: GREEN
-echo "--- Lanzando greencli ---"
-INSTANCE_GREEN=$(aws ec2 run-instances \
-    --image-id $AMI_ID \
-    --count 1 \
-    --instance-type t2.micro \
-    --security-group-ids "$SG_ID" \
-    --subnet-id "$SUBNET_ID" \
-    --region $REGION \
-    --user-data '#!/bin/bash
-                 yum update -y
-                 yum install -y httpd
-                 systemctl start httpd
-                 systemctl enable httpd
-                 echo "<html><body style=\"background-color:green; color:white; text-align:center; margin-top:50px;\"><h1>APP V2: GREEN</h1><p>Instancia: greencli</p></body></html>" > /var/www/html/index.html' \
-    --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=greencli}]' \
-    --query 'Instances[0].InstanceId' \
-    --output text)
+echo "Esperando a que VERDE esté listo..."
+aws elasticbeanstalk wait environment-exists --environment-names $ENV_GREEN --region $REGION
 
-echo "IDs: $INSTANCE_BLUE y $INSTANCE_GREEN. Esperando a que arranquen..."
-aws ec2 wait instance-running --instance-ids $INSTANCE_BLUE $INSTANCE_GREEN --region $REGION
+# --- 6. SWAP ---
+echo "--- 6. Realizando SWAP de CNAMEs ---"
+read -p "Presiona ENTER para intercambiar el tráfico..."
 
-# 5. CREAR LOAD BALANCER
-echo "--- Creando ELB ---"
-DNS_NAME=$(aws elb create-load-balancer \
-    --load-balancer-name ElbCLI \
-    --listeners "Protocol=HTTP,LoadBalancerPort=80,InstanceProtocol=HTTP,InstancePort=80" \
-    --subnets "$SUBNET_ID" \
-    --security-groups "$SG_ID" \
-    --region $REGION \
-    --query 'DNSName' \
-    --output text)
-
-# 6. HEALTH CHECK
-echo "--- Configurando Health Check ---"
-aws elb configure-health-check \
-    --load-balancer-name ElbCLI \
-    --health-check Target=HTTP:80/index.html,Interval=5,Timeout=2,UnhealthyThreshold=2,HealthyThreshold=2 \
+aws elasticbeanstalk swap-environment-cnames \
+    --source-environment-name $ENV_BLUE \
+    --destination-environment-name $ENV_GREEN \
     --region $REGION
 
-# 7. REGISTRAR INSTANCIAS
-echo "--- Registrando instancias ---"
-aws elb register-instances-with-load-balancer \
-    --load-balancer-name ElbCLI \
-    --instances $INSTANCE_BLUE $INSTANCE_GREEN \
-    --region $REGION
-
-echo "----------------------------------------------------------------"
-echo "LISTO. URL DEL BALANCEADOR:"
-echo "http://$DNS_NAME"
-echo "----------------------------------------------------------------"
+echo "--- ¡PROCESO FINALIZADO! ---"
